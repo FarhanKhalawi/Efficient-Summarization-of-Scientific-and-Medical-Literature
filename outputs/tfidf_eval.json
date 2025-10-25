@@ -1,0 +1,48 @@
+{
+  "tfidf_cosine_similarity": 0.291395333262516,
+  "coverage@0.10": 1.0,
+  "redundancy_avg_pairwise": 0.029736583493699564,
+  "top_keywords": [
+    [
+      "sheep",
+      0.2847473987257497
+    ],
+    [
+      "rl",
+      0.2847473987257497
+    ],
+    [
+      "group",
+      0.2847473987257497
+    ],
+    [
+      "reactive",
+      0.1898315991504998
+    ],
+    [
+      "resistance",
+      0.1898315991504998
+    ],
+    [
+      "airway",
+      0.1898315991504998
+    ],
+    [
+      "study",
+      0.0949157995752499
+    ],
+    [
+      "stable increased",
+      0.0949157995752499
+    ],
+    [
+      "sheep rl",
+      0.0949157995752499
+    ],
+    [
+      "volume resistance",
+      0.0949157995752499
+    ]
+  ],
+  "notes": "Higher similarity & coverage are good; lower redundancy is better."
+}

@@ -1,12 +1,16 @@
 # %% [markdown]
-# Summarization notebook — robust </summary> stopping, safer decoding, EOS stop, deterministic fallback
-# + TF-IDF evaluation (cosine, coverage, redundancy, keywords) with safe params
+# Summarization + TF-IDF evaluation + Hallucination evaluation (NLI, numeric checks, unsupported terms)
 #
-# References (for TF-IDF params and cosine similarity):
-# - scikit-learn TfidfVectorizer: https://scikit-learn.org/stable/modules/generated/sklearn.feature_extraction.text.TfidfVectorizer.html
-# - scikit-learn cosine_similarity: https://scikit-learn.org/stable/modules/generated/sklearn.metrics.pairwise.cosine_similarity.html
+# References:
+# - TF-IDF / cosine: https://scikit-learn.org/stable/modules/generated/sklearn.feature_extraction.text.TfidfVectorizer.html
+#                     https://scikit-learn.org/stable/modules/generated/sklearn.metrics.pairwise.cosine_similarity.html
+# - NLI model (BART MNLI): https://huggingface.co/facebook/bart-large-mnli
+# - Hallucination/factuality in summarization (why NLI > lexical overlap):
+#   Maynez et al., 2020: https://aclanthology.org/2020.acl-main.173/
+#   Pagnoni et al., 2021 (FRANK): https://aclanthology.org/2021.naacl-main.273/
+#   Goyal & Durrett, 2021: https://aclanthology.org/2021.naacl-main.299/
 
-# --- Set allocator env BEFORE importing torch (new var name) ---
+# --- Set allocator env BEFORE importing torch ---
 import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"  # replaces deprecated PYTORCH_CUDA_ALLOC_CONF
 
@@ -16,7 +20,7 @@ import numpy as np
 import pandas as pd
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
-from transformers import StoppingCriteria, StoppingCriteriaList
+from transformers import StoppingCriteria, StoppingCriteriaList, pipeline
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
@@ -47,7 +51,7 @@ if torch.cuda.is_available():
         MODEL_NAME,
         quantization_config=bnb_config,
         device_map="auto",
-        torch_dtype="auto",
+        dtype="auto",   # <- use dtype (torch_dtype is deprecated)
         low_cpu_mem_usage=True,
         offload_state_dict=True,
         offload_folder="offload",
@@ -57,7 +61,7 @@ else:
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME,
         device_map="auto",
-        torch_dtype="auto",
+        dtype="auto",
         low_cpu_mem_usage=True,
         offload_state_dict=True,
         offload_folder="offload",
@@ -79,12 +83,10 @@ def build_inputs(tok, system_msg, user_text):
     return messages, chat
 
 def strip_all_think_blocks(t: str) -> str:
-    # Remove any nested <think>...</think> sections robustly
     return re.sub(r"<think>.*?</think>", "", t, flags=re.DOTALL | re.IGNORECASE).strip()
 
 def safe_trim_to_first_n_sentences(text, n=4, min_keep=3):
     text = strip_all_think_blocks(text)
-    # Also remove any leading "Hmm," style prefaces
     text = re.sub(r"^\s*(?:Hmm[.,].*?\n+)+", "", text, flags=re.IGNORECASE | re.DOTALL).strip()
     sents = re.split(r"(?<=[.!?])\s+", text)
     if len(sents) > n:
@@ -94,16 +96,19 @@ def safe_trim_to_first_n_sentences(text, n=4, min_keep=3):
     return " ".join(sents).strip()
 
 def postprocess(decoded: str) -> str:
-    # Keep only the text after the LAST </think> (if any slipped through)
     if "</think>" in decoded:
         decoded = decoded.split("</think>")[-1]
-    # If <summary>...</summary> present, extract the inner text
     m = re.search(r"<summary>(.*?)</summary>", decoded, flags=re.DOTALL | re.IGNORECASE)
     final = (m.group(1) if m else decoded).strip()
-    # Normalize empty/ellipsis
     if final.strip() in {"", "...", "…"}:
         return ""
     return safe_trim_to_first_n_sentences(final, n=4, min_keep=3)
+
+def sanitize_numeric_glitches(text: str) -> str:
+    # Fix patterns like "n=-3" -> "n=3", and "- 6 sheep" -> "6 sheep"
+    text = re.sub(r'(?i)(n=\s*)-\s*(\d+)', r'\1\2', text)
+    text = re.sub(r'(?<!\d)-\s*(\d+)\s+(sheep|patients?|subjects?)', r'\1 \2', text, flags=re.I)
+    return text
 
 def get_embedding_device(model):
     try:
@@ -115,14 +120,9 @@ EMBED_DEVICE = get_embedding_device(model)
 print("Embedding device:", EMBED_DEVICE)
 
 class StopOnSubstrings(StoppingCriteria):
-    """
-    Stop generation once any of the provided stop strings appears at the end (token-wise).
-    This is complemented by a decoded-text cut for robustness.
-    """
     def __init__(self, stop_strings, tokenizer):
         super().__init__()
         self.stop_ids = [tokenizer.encode(s, add_special_tokens=False) for s in stop_strings]
-
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs) -> bool:
         last_tokens = input_ids[0].tolist()
         for s_ids in self.stop_ids:
@@ -134,38 +134,24 @@ STOP_STRINGS = ["</summary>"]
 STOPPER = StoppingCriteriaList([StopOnSubstrings(STOP_STRINGS, tok)])
 
 def cut_after_last_summary_tag(text: str) -> str:
-    """
-    Hard-cut decoded text right after the first occurrence of </summary>.
-    This complements token-level stopping and ensures a clean end.
-    """
     end_tag = "</summary>"
     pos = text.find(end_tag)
-    if pos != -1:
-        return text[:pos + len(end_tag)]
-    return text
+    return text[:pos + len(end_tag)] if pos != -1 else text
 
 def get_model_ctx(model, default_ctx=262144):
-    """
-    Try to read the model's max context length; fall back to a large safe default.
-    """
     ctx = getattr(getattr(model, "config", object()), "max_position_embeddings", None)
-    if isinstance(ctx, int) and ctx > 0:
-        return ctx
-    return default_ctx  # Qwen3 models advertise very long contexts
+    return int(ctx) if isinstance(ctx, int) and ctx > 0 else default_ctx
 
 def generate_summary(model, tok, chat, system_msg_for_rebuild,
                      keep_tokens_for_answer=512, source_text=None,
-                     gen_temp=0.4, gen_top_p=0.9, greedy=False):
-    # Determine context and set a prompt budget
+                     gen_temp=0.3, gen_top_p=0.9, greedy=False):
     max_ctx = int(get_model_ctx(model))
     reserve = keep_tokens_for_answer + 64
     prompt_budget = max(256, max_ctx - reserve)
 
-    # Tokenize + move to embedding device
     inputs = tok([chat], return_tensors="pt", truncation=True, max_length=prompt_budget)
     inputs = {k: v.to(EMBED_DEVICE) for k, v in inputs.items()}
 
-    # Rebuild from head if still too long
     if inputs["input_ids"].shape[1] >= prompt_budget and source_text:
         head_enc = tok(source_text, return_tensors="pt", truncation=True, max_length=prompt_budget)
         trimmed = tok.decode(head_enc["input_ids"][0], skip_special_tokens=True)
@@ -173,14 +159,13 @@ def generate_summary(model, tok, chat, system_msg_for_rebuild,
         inputs = tok([chat2], return_tensors="pt", truncation=True, max_length=prompt_budget)
         inputs = {k: v.to(EMBED_DEVICE) for k, v in inputs.items()}
 
-    # Ensure pad token again (defensive)
     if tok.pad_token_id is None and tok.eos_token_id is not None:
         tok.pad_token = tok.eos_token
 
     gen_kwargs = dict(
         max_new_tokens=320,
-        eos_token_id=tok.eos_token_id,     # allow EOS to stop as well
-        stopping_criteria=STOPPER,         # primary hard stop at </summary>
+        eos_token_id=tok.eos_token_id,
+        stopping_criteria=STOPPER,
         no_repeat_ngram_size=3,
     )
     if greedy:
@@ -191,11 +176,8 @@ def generate_summary(model, tok, chat, system_msg_for_rebuild,
     with torch.inference_mode():
         out = model.generate(**inputs, **gen_kwargs)
 
-    # Decode only the newly generated tokens
     new_tokens = out[0][inputs["input_ids"].shape[1]:]
     decoded = tok.decode(new_tokens, skip_special_tokens=False, clean_up_tokenization_spaces=False)
-
-    # Hard-cut after </summary> in decoded space for robustness
     decoded = cut_after_last_summary_tag(decoded)
     return decoded
 
@@ -226,16 +208,18 @@ except Exception as e:
 SYSTEM_MSG_TAGGED = (
     "Summarize the user's medical abstract in 3–4 sentences. "
     "Be clear and factual. Keep key clinical details (condition, intervention, measurements, outcomes). "
+    "Copy numeric values (n, percentages, measurements) exactly from the input; omit if unspecified. "
     "Return ONLY the summary wrapped exactly as:\n<summary>...</summary>\nNo preface, no analysis, no extra text."
 )
 
 SYSTEM_MSG_FALLBACK = (
     "Summarize the user's medical abstract in 3–4 sentences. "
     "Be clear and factual. Keep key clinical details (condition, intervention, measurements, outcomes). "
+    "Copy numeric values exactly; omit if unspecified. "
     "Output ONLY the 3–4 sentence summary—no preface, no analysis."
 )
 
-GEN_TEMP, GEN_TOPP = 0.4, 0.9
+GEN_TEMP, GEN_TOPP = 0.3, 0.9
 
 # Attempt 1
 _, chat = build_inputs(tok, SYSTEM_MSG_TAGGED, source_text)
@@ -246,6 +230,7 @@ decoded = generate_summary(
     gen_temp=GEN_TEMP, gen_top_p=GEN_TOPP, greedy=False
 )
 summary = postprocess(decoded)
+summary = sanitize_numeric_glitches(summary)
 
 # Fallback: deterministic pass
 if not summary:
@@ -254,13 +239,10 @@ if not summary:
     decoded_fb = generate_summary(
         model, tok, chat_fb, system_msg_for_rebuild=SYSTEM_MSG_FALLBACK,
         keep_tokens_for_answer=512, source_text=source_text,
-        gen_temp=0.7, gen_top_p=0.95, greedy=True
+        gen_temp=0.2, gen_top_p=0.95, greedy=True
     )
     summary = postprocess(decoded_fb)
-
-# Final guardrail: strip leading lone "I ..." lines
-if summary and summary[:1].lower() == "i":
-    summary = re.sub(r"(^|\n)I[^\n]*", "", summary).strip()
+    summary = sanitize_numeric_glitches(summary)
 
 if not summary:
     preview = (decoded or "")[:400].replace("\n", " ")
@@ -283,29 +265,16 @@ def split_sentences(text: str):
     return [s.strip() for s in re.split(r'(?<=[.!?])\s+', text) if s.strip()]
 
 def _safe_max_df(n_docs: int, max_df):
-    """
-    If corpus is tiny (<=10 docs), force max_df=1.0 so shared terms aren't dropped.
-    See scikit-learn docs for max_df semantics:
-    https://scikit-learn.org/stable/modules/generated/sklearn.feature_extraction.text.TfidfVectorizer.html
-    """
-    if isinstance(max_df, float):
-        if n_docs <= 10:
-            return 1.0
-        return max_df
-    return max_df  # integer path left unchanged by design
+    if isinstance(max_df, float) and n_docs <= 10:
+        return 1.0
+    return max_df
 
 def tfidf_eval(source_text: str, summary: str,
                ngram_range=(1,2), max_df=0.9, min_df=1,
                coverage_threshold=0.10, use_stopwords=True):
-    """
-    - Global similarity (2 docs) adapts max_df to keep shared terms in tiny corpora.
-    - Coverage (many src sents + 1 summary) adapts max_df similarly.
-    - Redundancy (summary sentences only) forces max_df=1.0 for stability.
-    - Keywords (single doc) forces max_df=1.0 for stability.
-    """
     stop = 'english' if use_stopwords else None
 
-    # --- Global similarity (2 docs) ---
+    # Global similarity (2 docs)
     docs = [source_text, summary]
     vec_global = TfidfVectorizer(lowercase=True, stop_words=stop,
                                  ngram_range=ngram_range,
@@ -314,7 +283,7 @@ def tfidf_eval(source_text: str, summary: str,
     X = vec_global.fit_transform(docs)
     global_sim = float(cosine_similarity(X[0], X[1])[0, 0])
 
-    # --- Coverage (many src sentences + 1 summary) ---
+    # Coverage (source sentences vs summary)
     src_sents = split_sentences(source_text)[:200] or [source_text]
     cov_docs = src_sents + [summary]
     vec_cov = TfidfVectorizer(lowercase=True, stop_words=stop,
@@ -326,24 +295,24 @@ def tfidf_eval(source_text: str, summary: str,
     sent_sims = cosine_similarity(S, q).ravel()
     coverage = float((sent_sims >= coverage_threshold).mean())
 
-    # --- Redundancy (within-summary) ---
+    # Redundancy (within-summary)
     summ_sents = split_sentences(summary)
     if len(summ_sents) >= 2:
         vec_red = TfidfVectorizer(lowercase=True, stop_words=stop,
                                   ngram_range=ngram_range,
-                                  max_df=1.0, min_df=1)  # force keep shared terms
+                                  max_df=1.0, min_df=1)
         X_red = vec_red.fit_transform(summ_sents)
         C = cosine_similarity(X_red)
         redundancy = float((C.sum() - np.trace(C)) / (C.shape[0]*C.shape[1] - C.shape[0]))
     else:
         redundancy = 0.0
 
-    # --- Top keywords (single doc: summary) ---
+    # Top keywords (summary)
     top_keywords = []
     if len(re.findall(r"\w+", summary)) >= 2:
         vec_kw = TfidfVectorizer(lowercase=True, stop_words=stop,
                                  ngram_range=ngram_range,
-                                 max_df=1.0, min_df=1)  # single-doc safe
+                                 max_df=1.0, min_df=1)
         try:
             X_kw = vec_kw.fit_transform([summary])
             vocab = np.array(vec_kw.get_feature_names_out())
@@ -368,9 +337,8 @@ metrics = tfidf_eval(
     max_df=0.9,
     min_df=1,
     coverage_threshold=0.10,
-    use_stopwords=True  # set to False if your texts are very short/specific
+    use_stopwords=True
 )
-
 print("\n--- TF-IDF EVAL ---")
 for k, v in metrics.items():
     if k == "top_keywords":
@@ -381,3 +349,104 @@ for k, v in metrics.items():
 with open("outputs/tfidf_eval.json", "w", encoding="utf-8") as f:
     json.dump(metrics, f, ensure_ascii=False, indent=2)
 print("Saved TF-IDF metrics to outputs/tfidf_eval.json")
+
+# -----------------------------------------------------------------------------
+# Hallucination evaluation: NLI + numeric consistency + unsupported terms
+# -----------------------------------------------------------------------------
+def extract_numbers(text: str):
+    # captures ints/decimals/percents, forms like "n=12", "12%", "18.5", "1,200"
+    nums = re.findall(r'(?:n\s*=\s*)?-?\d{1,3}(?:,\d{3})*(?:\.\d+)?%?', text, flags=re.I)
+    norm = []
+    for x in nums:
+        y = x.lower().replace(' ', '')
+        y = y.replace(',', '')  # 1,200 -> 1200
+        norm.append(y)
+    return norm
+
+def content_words(text: str):
+    stop = set("""
+        a an the and or of in on with without to for from by as at is are was were be been being that this these those
+        it its their his her them they we you i he she not no yes do does did done than then over under into out up down
+    """.split())
+    toks = [t.lower() for t in re.findall(r"[A-Za-z][A-Za-z\-']+", text)]
+    return [t for t in toks if len(t) > 2 and t not in stop]
+
+def hallucination_eval(source_text: str, summary: str, device=None):
+    # 1) NLI-based factuality per sentence (premise=source, hypothesis=sent)
+    nli_dev = (device if device is not None else (0 if torch.cuda.is_available() else -1))
+
+    nli = pipeline(
+        "text-classification",
+        model="facebook/bart-large-mnli",
+        device=nli_dev,
+        return_all_scores=True   # get ENTAILMENT / NEUTRAL / CONTRADICTION scores
+    )
+
+    summ_sents = split_sentences(summary) or [summary]
+
+    entail_scores, contra_scores, neutral_scores = [], [], []
+    for sent in summ_sents:
+        # For MNLI, pass: text=premise, text_pair=hypothesis
+        out = nli({"text": source_text, "text_pair": sent}, function_to_apply="softmax")[0]
+        score_map = {o["label"].lower(): float(o["score"]) for o in out}
+        entail_scores.append(score_map.get("entailment", 0.0))
+        contra_scores.append(score_map.get("contradiction", 0.0))
+        neutral_scores.append(score_map.get("neutral", 0.0))
+
+    entail_rate = float(np.mean([s > 0.5 for s in entail_scores]))
+    contra_rate = float(np.mean([s > 0.5 for s in contra_scores]))
+    avg_entail = float(np.mean(entail_scores))
+    avg_contra = float(np.mean(contra_scores))
+
+    # 2) Numeric consistency: numbers in summary not present in source
+    src_nums = set(extract_numbers(source_text))
+    sum_nums = extract_numbers(summary)
+    numeric_unsupported = [n for n in sum_nums if n not in src_nums]
+
+    # 3) Unsupported-term rate: summary content words missing from source
+    src_vocab = set(content_words(source_text))
+    sum_vocab = content_words(summary)
+    missing_terms = [w for w in sum_vocab if w not in src_vocab]
+    unsupported_term_rate = float(len(missing_terms) / max(1, len(sum_vocab)))
+
+    # Simple combined heuristic flag (tune thresholds for your domain)
+    hallucination_flag = (contra_rate > 0.2) or (len(numeric_unsupported) > 0) or (unsupported_term_rate > 0.5)
+
+    return {
+        "nli_avg_entailment": avg_entail,
+        "nli_avg_contradiction": avg_contra,
+        "nli_entailment_rate@0.5": entail_rate,
+        "nli_contradiction_rate@0.5": contra_rate,
+        "numeric_unsupported": numeric_unsupported,
+        "unsupported_term_rate": unsupported_term_rate,
+        "missing_terms_sample": missing_terms[:20],
+        "hallucination_flag": hallucination_flag,
+        "notes": "Lower contradiction, empty numeric_unsupported, and low unsupported_term_rate indicate fewer hallucinations.",
+        "per_sentence_entailment": dict(zip(summ_sents, [float(s) for s in entail_scores])),
+        "per_sentence_contradiction": dict(zip(summ_sents, [float(s) for s in contra_scores])),
+    }
+
+# Important: free the big model before creating the NLI pipeline to avoid OOM
+del model
+torch.cuda.empty_cache()
+
+hall = hallucination_eval(source_text, summary, device=None)  # set device=-1 to force CPU
+print("\n--- HALLUCINATION EVAL ---")
+for k, v in hall.items():
+    if isinstance(v, float):
+        print(f"{k}: {v:.4f}")
+    elif isinstance(v, list):
+        print(f"{k}: {v}")
+    elif isinstance(v, dict):
+        print(f"{k}:")
+        for kk, vv in v.items():
+            try:
+                print(f"  - {kk} :: {vv:.3f}")
+            except Exception:
+                print(f"  - {kk} :: {vv}")
+    else:
+        print(f"{k}: {v}")
+
+with open("outputs/hallucination_eval.json", "w", encoding="utf-8") as f:
+    json.dump(hall, f, ensure_ascii=False, indent=2)
+print("Saved hallucination metrics to outputs/hallucination_eval.json")
