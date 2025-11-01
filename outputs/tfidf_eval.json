@@ -1,47 +1,47 @@
 {
-  "tfidf_cosine_similarity": 0.2578473934491408,
-  "coverage@0.10": 1.0,
-  "redundancy_avg_pairwise": 0.018815621722534964,
+  "tfidf_cosine_similarity": 0.009694057293421975,
+  "coverage@0.10": 0.0,
+  "redundancy_avg_pairwise": 0.0070272996832911145,
   "top_keywords": [
     [
-      "sheep",
-      0.2750095491084634
+      "summarize",
+      0.2407717061715384
     ],
     [
-      "group",
-      0.2750095491084634
+      "wrapped summary",
+      0.1203858530857692
     ],
     [
-      "airway",
-      0.2750095491084634
+      "wrapped",
+      0.1203858530857692
     ],
     [
-      "reactive",
-      0.18333969940564226
+      "wants summarize",
+      0.1203858530857692
     ],
     [
-      "stable",
-      0.09166984970282113
+      "verbatim avoid",
+      0.1203858530857692
     ],
     [
-      "sheep model",
-      0.09166984970282113
+      "wants",
+      0.1203858530857692
     ],
     [
-      "sheep groups",
-      0.09166984970282113
+      "ve provided",
+      0.1203858530857692
     ],
     [
-      "sheep ascaris",
-      0.09166984970282113
+      "ve",
+      0.1203858530857692
     ],
     [
-      "saline group",
-      0.09166984970282113
+      "values verbatim",
+      0.1203858530857692
     ],
     [
-      "saline",
-      0.09166984970282113
+      "verbatim",
+      0.1203858530857692
     ]
   ],
   "notes": "Higher similarity & coverage are good; lower redundancy is better."

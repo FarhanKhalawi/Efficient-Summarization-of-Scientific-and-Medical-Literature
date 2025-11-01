@@ -12,7 +12,7 @@
 
 # --- Set allocator env BEFORE importing torch ---
 import os
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"  # replaces deprecated PYTORCH_CUDA_ALLOC_CONF
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import re
 import json
@@ -20,7 +20,7 @@ import numpy as np
 import pandas as pd
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
-from transformers import StoppingCriteria, StoppingCriteriaList, pipeline
+from transformers import StoppingCriteria, StoppingCriteriaList
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
@@ -41,17 +41,15 @@ print("Loading tokenizer & model...")
 
 tok = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=True)
 
-# Ensure we have a pad token
 if tok.pad_token_id is None and tok.eos_token_id is not None:
     tok.pad_token = tok.eos_token
 
-# Load model (GPU path uses 4-bit quant + auto device map; CPU fallback allowed)
 if torch.cuda.is_available():
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME,
         quantization_config=bnb_config,
         device_map="auto",
-        dtype="auto",   # <- use dtype (torch_dtype is deprecated)
+        dtype="auto",
         low_cpu_mem_usage=True,
         offload_state_dict=True,
         offload_folder="offload",
@@ -71,9 +69,9 @@ else:
 model.eval()
 print("Model loaded successfully!")
 
-# -----------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 # Utilities
-# -----------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 def build_inputs(tok, system_msg, user_text):
     messages = [
         {"role": "system", "content": system_msg},
@@ -105,10 +103,21 @@ def postprocess(decoded: str) -> str:
     return safe_trim_to_first_n_sentences(final, n=4, min_keep=3)
 
 def sanitize_numeric_glitches(text: str) -> str:
-    # Fix patterns like "n=-3" -> "n=3", and "- 6 sheep" -> "6 sheep"
     text = re.sub(r'(?i)(n=\s*)-\s*(\d+)', r'\1\2', text)
     text = re.sub(r'(?<!\d)-\s*(\d+)\s+(sheep|patients?|subjects?)', r'\1 \2', text, flags=re.I)
     return text
+
+def strip_meta_thoughts(text: str) -> str:
+    """Remove model reasoning or meta-thinking phrases."""
+    text = strip_all_think_blocks(text)
+    patterns = [
+        r"(?i)\b(looking at this abstract|i notice|the user said|i think|this means|let's see|the model)\b.*",
+        r"(?i)\b(in summary,|in conclusion,|overall, this abstract)\b.*",
+    ]
+    for p in patterns:
+        text = re.sub(p, "", text)
+    text = re.sub(r"<.*?>", "", text)
+    return text.strip()
 
 def get_embedding_device(model):
     try:
@@ -181,9 +190,9 @@ def generate_summary(model, tok, chat, system_msg_for_rebuild,
     decoded = cut_after_last_summary_tag(decoded)
     return decoded
 
-# -----------------------------------------------------------------------------
-# Data load (CSV or fallback)
-# -----------------------------------------------------------------------------
+# -------------------------------------------------------------------------
+# Data load
+# -------------------------------------------------------------------------
 try:
     df = pd.read_csv(CSV_PATH)
     source_text = str(df.iloc[0]["TEXT"]).strip()
@@ -200,11 +209,10 @@ except Exception as e:
         "adverse events were mild and comparable. "
         "Conclusion: The ACE inhibitor significantly reduced blood pressure with acceptable safety."
     )
-    print("Using fallback abstract. Characters:", len(source_text))
 
-# -----------------------------------------------------------------------------
-# Prompts & generate
-# -----------------------------------------------------------------------------
+# -------------------------------------------------------------------------
+# Prompts & generation
+# -------------------------------------------------------------------------
 SYSTEM_MSG_TAGGED = (
     "Summarize the user's medical abstract in 3–4 sentences. "
     "Be clear and factual. Keep key clinical details (condition, intervention, measurements, outcomes). "
@@ -221,42 +229,32 @@ SYSTEM_MSG_FALLBACK = (
 
 GEN_TEMP, GEN_TOPP = 0.3, 0.9
 
-# Attempt 1
 _, chat = build_inputs(tok, SYSTEM_MSG_TAGGED, source_text)
 print("Generating summary (attempt 1)...")
-decoded = generate_summary(
-    model, tok, chat, system_msg_for_rebuild=SYSTEM_MSG_TAGGED,
-    keep_tokens_for_answer=512, source_text=source_text,
-    gen_temp=GEN_TEMP, gen_top_p=GEN_TOPP, greedy=False
-)
+decoded = generate_summary(model, tok, chat, SYSTEM_MSG_TAGGED,
+                           keep_tokens_for_answer=512, source_text=source_text,
+                           gen_temp=GEN_TEMP, gen_top_p=GEN_TOPP, greedy=False)
 summary = postprocess(decoded)
 summary = sanitize_numeric_glitches(summary)
+summary = strip_meta_thoughts(summary)
 
-# Fallback: deterministic pass
 if not summary:
     print("Generating summary (attempt 2, deterministic fallback)...")
     _, chat_fb = build_inputs(tok, SYSTEM_MSG_FALLBACK, source_text)
-    decoded_fb = generate_summary(
-        model, tok, chat_fb, system_msg_for_rebuild=SYSTEM_MSG_FALLBACK,
-        keep_tokens_for_answer=512, source_text=source_text,
-        gen_temp=0.2, gen_top_p=0.95, greedy=True
-    )
+    decoded_fb = generate_summary(model, tok, chat_fb, SYSTEM_MSG_FALLBACK,
+                                  keep_tokens_for_answer=512, source_text=source_text,
+                                  gen_temp=0.2, gen_top_p=0.95, greedy=True)
     summary = postprocess(decoded_fb)
     summary = sanitize_numeric_glitches(summary)
-
-if not summary:
-    preview = (decoded or "")[:400].replace("\n", " ")
-    print("\n[Debug] Model raw (first 400 chars):", preview)
-    summary = "Summary unavailable: the model did not produce a clean summary."
+    summary = strip_meta_thoughts(summary)
 
 print("\n--- SUMMARY ---\n")
 print(summary)
 
 os.makedirs("outputs", exist_ok=True)
-out_path = "outputs/summary_first_test.txt"
-with open(out_path, "w", encoding="utf-8") as f:
+with open("outputs/summary_first_test.txt", "w", encoding="utf-8") as f:
     f.write(summary + "\n")
-print(f"\nSaved to {out_path}")
+print("Saved to outputs/summary_first_test.txt")
 
 # -----------------------------------------------------------------------------
 # TF-IDF evaluation (robust for tiny corpora)
@@ -350,103 +348,123 @@ with open("outputs/tfidf_eval.json", "w", encoding="utf-8") as f:
     json.dump(metrics, f, ensure_ascii=False, indent=2)
 print("Saved TF-IDF metrics to outputs/tfidf_eval.json")
 
-# -----------------------------------------------------------------------------
-# Hallucination evaluation: NLI + numeric consistency + unsupported terms
-# -----------------------------------------------------------------------------
+
+# =============================================================================
+# Hallucination Evaluation : manual NLI + numeric words + unsupported terms
+# =============================================================================
+print("\n--- HALLUCINATION EVALUATION ---")
+
+import torch
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+
+# 1️⃣ NLI-BASED FACTUAL CONSISTENCY (manual, CPU-safe)
+try:
+    print("Loading NLI model (manual, CPU)...")
+    nli_model_name = "facebook/bart-large-mnli"
+    nli_tok = AutoTokenizer.from_pretrained(nli_model_name)
+    nli_model = AutoModelForSequenceClassification.from_pretrained(nli_model_name)
+    nli_model.to("cpu")
+    nli_model.eval()
+
+    summary_sents = split_sentences(summary)
+    nli_results = []
+
+    def nli_score(premise: str, hypothesis: str):
+        # premise = source_text, hypothesis = one summary sentence
+        inputs = nli_tok(
+            premise,
+            hypothesis,
+            return_tensors="pt",
+            truncation=True,
+            padding="max_length",
+            max_length=512,
+        )
+        with torch.no_grad():
+            outputs = nli_model(**inputs)
+            logits = outputs.logits[0]  # (3,)
+            probs = torch.softmax(logits, dim=-1)
+        # BART-MNLI order: 0=contradiction, 1=neutral, 2=entailment
+        labels = ["contradiction", "neutral", "entailment"]
+        top_idx = int(torch.argmax(probs).item())
+        return labels[top_idx], float(probs[top_idx])
+
+    for s in summary_sents:
+        lbl, sc = nli_score(source_text, s)
+        nli_results.append((s, lbl, sc))
+
+    entail_count = sum(1 for _, lbl, _ in nli_results if lbl == "entailment")
+    nli_entailment_rate = entail_count / len(summary_sents) if summary_sents else 0.0
+
+    print(f"NLI entailment rate: {nli_entailment_rate:.3f}")
+    print("Sentence-level NLI labels:")
+    for sent, lbl, score in nli_results:
+        print(f"  [{lbl.upper()}] ({score:.2f}) {sent}")
+
+except Exception as e:
+    print("⚠️ NLI evaluation skipped due to error:", e)
+    nli_entailment_rate, nli_results = None, []
+
+# 2️⃣ NUMERIC CONSISTENCY (supports number words)
+# many medical abstracts write numbers as words: "three", "six", "eight"
+NUM_WORDS = {
+    "zero": "0", "one": "1", "two": "2", "three": "3", "four": "4",
+    "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9",
+    "ten": "10", "eleven": "11", "twelve": "12"
+}
+
+def normalize_number_words(text: str) -> str:
+    def repl(m):
+        w = m.group(0).lower()
+        return NUM_WORDS.get(w, w)
+    # replace standalone number words
+    pattern = r"\b(" + "|".join(NUM_WORDS.keys()) + r")\b"
+    return re.sub(pattern, repl, text, flags=re.IGNORECASE)
+
 def extract_numbers(text: str):
-    # captures ints/decimals/percents, forms like "n=12", "12%", "18.5", "1,200"
-    nums = re.findall(r'(?:n\s*=\s*)?-?\d{1,3}(?:,\d{3})*(?:\.\d+)?%?', text, flags=re.I)
-    norm = []
-    for x in nums:
-        y = x.lower().replace(' ', '')
-        y = y.replace(',', '')  # 1,200 -> 1200
-        norm.append(y)
-    return norm
+    return re.findall(r"\d+(?:[.,]\d+)?", text)
 
-def content_words(text: str):
-    stop = set("""
-        a an the and or of in on with without to for from by as at is are was were be been being that this these those
-        it its their his her them they we you i he she not no yes do does did done than then over under into out up down
-    """.split())
-    toks = [t.lower() for t in re.findall(r"[A-Za-z][A-Za-z\-']+", text)]
-    return [t for t in toks if len(t) > 2 and t not in stop]
+# normalize both texts first
+norm_source = normalize_number_words(source_text)
+norm_summary = normalize_number_words(summary)
 
-def hallucination_eval(source_text: str, summary: str, device=None):
-    # 1) NLI-based factuality per sentence (premise=source, hypothesis=sent)
-    nli_dev = (device if device is not None else (0 if torch.cuda.is_available() else -1))
+src_nums = extract_numbers(norm_source)
+sum_nums = extract_numbers(norm_summary)
 
-    nli = pipeline(
-        "text-classification",
-        model="facebook/bart-large-mnli",
-        device=nli_dev,
-        return_all_scores=True   # get ENTAILMENT / NEUTRAL / CONTRADICTION scores
-    )
+if not sum_nums:
+    numeric_consistency = 1.0
+    mismatch_nums = []
+else:
+    mismatch_nums = [n for n in sum_nums if n not in src_nums]
+    numeric_consistency = 1.0 - (len(mismatch_nums) / len(sum_nums))
 
-    summ_sents = split_sentences(summary) or [summary]
+print(f"Numeric consistency: {numeric_consistency:.3f}")
+if mismatch_nums:
+    print("Mismatched numbers in summary:", mismatch_nums)
 
-    entail_scores, contra_scores, neutral_scores = [], [], []
-    for sent in summ_sents:
-        # For MNLI, pass: text=premise, text_pair=hypothesis
-        out = nli({"text": source_text, "text_pair": sent}, function_to_apply="softmax")[0]
-        score_map = {o["label"].lower(): float(o["score"]) for o in out}
-        entail_scores.append(score_map.get("entailment", 0.0))
-        contra_scores.append(score_map.get("contradiction", 0.0))
-        neutral_scores.append(score_map.get("neutral", 0.0))
+# 3️⃣ UNSUPPORTED TERMs (only alphabetic tokens, no stopwords)
+from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
 
-    entail_rate = float(np.mean([s > 0.5 for s in entail_scores]))
-    contra_rate = float(np.mean([s > 0.5 for s in contra_scores]))
-    avg_entail = float(np.mean(entail_scores))
-    avg_contra = float(np.mean(contra_scores))
+def clean_tokens_alpha(text):
+    return [
+        w.lower()
+        for w in re.findall(r"\b[a-zA-Z]+\b", text)
+        if w.lower() not in ENGLISH_STOP_WORDS
+    ]
 
-    # 2) Numeric consistency: numbers in summary not present in source
-    src_nums = set(extract_numbers(source_text))
-    sum_nums = extract_numbers(summary)
-    numeric_unsupported = [n for n in sum_nums if n not in src_nums]
+src_words = set(clean_tokens_alpha(source_text))
+sum_words = set(clean_tokens_alpha(summary))
+unsupported_terms = sorted(list(sum_words - src_words))
 
-    # 3) Unsupported-term rate: summary content words missing from source
-    src_vocab = set(content_words(source_text))
-    sum_vocab = content_words(summary)
-    missing_terms = [w for w in sum_vocab if w not in src_vocab]
-    unsupported_term_rate = float(len(missing_terms) / max(1, len(sum_vocab)))
+print(f"Unsupported terms detected ({len(unsupported_terms)}): {unsupported_terms[:20]}")
 
-    # Simple combined heuristic flag (tune thresholds for your domain)
-    hallucination_flag = (contra_rate > 0.2) or (len(numeric_unsupported) > 0) or (unsupported_term_rate > 0.5)
-
-    return {
-        "nli_avg_entailment": avg_entail,
-        "nli_avg_contradiction": avg_contra,
-        "nli_entailment_rate@0.5": entail_rate,
-        "nli_contradiction_rate@0.5": contra_rate,
-        "numeric_unsupported": numeric_unsupported,
-        "unsupported_term_rate": unsupported_term_rate,
-        "missing_terms_sample": missing_terms[:20],
-        "hallucination_flag": hallucination_flag,
-        "notes": "Lower contradiction, empty numeric_unsupported, and low unsupported_term_rate indicate fewer hallucinations.",
-        "per_sentence_entailment": dict(zip(summ_sents, [float(s) for s in entail_scores])),
-        "per_sentence_contradiction": dict(zip(summ_sents, [float(s) for s in contra_scores])),
-    }
-
-# Important: free the big model before creating the NLI pipeline to avoid OOM
-del model
-torch.cuda.empty_cache()
-
-hall = hallucination_eval(source_text, summary, device=None)  # set device=-1 to force CPU
-print("\n--- HALLUCINATION EVAL ---")
-for k, v in hall.items():
-    if isinstance(v, float):
-        print(f"{k}: {v:.4f}")
-    elif isinstance(v, list):
-        print(f"{k}: {v}")
-    elif isinstance(v, dict):
-        print(f"{k}:")
-        for kk, vv in v.items():
-            try:
-                print(f"  - {kk} :: {vv:.3f}")
-            except Exception:
-                print(f"  - {kk} :: {vv}")
-    else:
-        print(f"{k}: {v}")
-
+# SAVE
+hallucination_metrics = {
+    "nli_entailment_rate": nli_entailment_rate,
+    "numeric_consistency": numeric_consistency,
+    "unsupported_terms": unsupported_terms[:50],
+}
+os.makedirs("outputs", exist_ok=True)
 with open("outputs/hallucination_eval.json", "w", encoding="utf-8") as f:
-    json.dump(hall, f, ensure_ascii=False, indent=2)
+    json.dump(hallucination_metrics, f, ensure_ascii=False, indent=2)
 print("Saved hallucination metrics to outputs/hallucination_eval.json")
+
