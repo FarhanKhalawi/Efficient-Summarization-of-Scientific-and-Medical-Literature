@@ -1,47 +1,47 @@
 {
-  "tfidf_cosine_similarity": 0.009694057293421975,
-  "coverage@0.10": 0.0,
-  "redundancy_avg_pairwise": 0.0070272996832911145,
+  "tfidf_cosine_similarity": 0.3083554578612154,
+  "coverage@0.10": 1.0,
+  "redundancy_avg_pairwise": 0.013497292226220203,
   "top_keywords": [
     [
-      "summarize",
-      0.2407717061715384
+      "sheep",
+      0.423999152002544
     ],
     [
-      "wrapped summary",
-      0.1203858530857692
+      "group",
+      0.31799936400190804
     ],
     [
-      "wrapped",
-      0.1203858530857692
+      "group sheep",
+      0.31799936400190804
     ],
     [
-      "wants summarize",
-      0.1203858530857692
+      "rl",
+      0.211999576001272
     ],
     [
-      "verbatim avoid",
-      0.1203858530857692
+      "study groups",
+      0.105999788000636
     ],
     [
-      "wants",
-      0.1203858530857692
+      "trapping",
+      0.105999788000636
     ],
     [
-      "ve provided",
-      0.1203858530857692
+      "volume frc",
+      0.105999788000636
     ],
     [
-      "ve",
-      0.1203858530857692
+      "stable rl",
+      0.105999788000636
     ],
     [
-      "values verbatim",
-      0.1203858530857692
+      "study",
+      0.105999788000636
     ],
     [
-      "verbatim",
-      0.1203858530857692
+      "sheep reactive",
+      0.105999788000636
     ]
   ],
   "notes": "Higher similarity & coverage are good; lower redundancy is better."
