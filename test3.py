@@ -1,4 +1,3 @@
-
 import os
 import re
 from datetime import datetime
@@ -40,7 +39,7 @@ def _ensure_nltk_data():
             nltk.data.find(f"corpora/{corpus}")
         except LookupError:
             nltk.download(corpus, quiet=True)
-    # POS tagger: new + legacy names
+    # POS tagger: try new + legacy names
     def _ensure_tagger():
         try:
             nltk.data.find("taggers/averaged_perceptron_tagger_eng"); return
@@ -94,6 +93,9 @@ OUT_CSV  = os.path.join(OUT_DIR, "results.csv")
 HEATMAP_PNG = os.path.join(OUT_DIR, "metric_correlation_heatmap.png")
 BAR_PNG     = os.path.join(OUT_DIR, "avg_metrics_bar.png")
 
+# How many items to process
+NUM_ITEMS = 90
+
 # -------------------------------
 # Load data and model
 # -------------------------------
@@ -115,7 +117,7 @@ gen_cfg = GenerationConfig(
     do_sample=True,
     temperature=0.7,
     top_p=0.9,
-    top_k=20,  # set explicitly
+    top_k=20,
     max_new_tokens=256,
     min_new_tokens=40,
     pad_token_id=tokenizer.eos_token_id,
@@ -157,7 +159,10 @@ def normalize_and_lemmatize(text: str):
 rows_out = []
 run_stamp = datetime.now().isoformat(timespec="seconds")
 
-for i in range(10):
+n_items = min(NUM_ITEMS, len(test_df))
+print(f"Processing {n_items} items ...")
+
+for i in range(n_items):
     print(f"\n====================== SAMPLE {i+1} ======================\n")
     row = test_df.iloc[i]
     original_text = str(row["TEXT"])
@@ -231,7 +236,19 @@ for i in range(10):
     print(f"ROUGE-2 F1: {r2:.4f}")
     print(f"ROUGE-L F1: {rL:.4f}")
 
-    # Hallucination check
+    # -------------------------------------------------------
+    # Hallucination check (method explained)
+    # -------------------------------------------------------
+    # Idea:
+    # 1) Normalize & lemmatize tokens from source text, model summary, and human summary.
+    # 2) Mark a summary token as "unsupported" if it is not present in the source token set
+    #    and not a common scientific filler (e.g., "study", "method", etc.).
+    # 3) "Truly unsupported" = unsupported AND not present in the human summary either.
+    # 4) Separately detect numbers in the summary that do not appear in the source text.
+    # 5) Compute unsupported_ratio = (# truly unsupported tokens) / (summary token count).
+    # 6) Mix with a softening factor based on ROUGE-1 (higher ROUGE -> slightly lower penalty)
+    #    and add a small penalty (0.05) per hallucinated number.
+    # 7) Map the final score to LOW / MEDIUM / HIGH levels.
     print("\n--- HALLUCINATION CHECK ---")
     src_tokens = normalize_and_lemmatize(original_text)
     sum_tokens = normalize_and_lemmatize(generated_summary)
@@ -320,7 +337,7 @@ print(f"Saved heatmap: {HEATMAP_PNG}")
 means = df_all[metrics_cols].mean()
 fig2, ax2 = plt.subplots(figsize=(8, 4))
 ax2.bar(means.index, means.values)  # default colors; single plot
-ax2.set_title("Average metrics over 10 items")
+ax2.set_title("Average metrics over 90 items")
 ax2.set_ylabel("Score")
 ax2.tick_params(axis='x', labelrotation=20)
 fig2.tight_layout()
