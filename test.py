@@ -11,7 +11,7 @@ from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     GenerationConfig,
-    AutoModelForSequenceClassification
+    AutoModelForSequenceClassification,
 )
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
@@ -26,6 +26,7 @@ from nltk.tokenize import word_tokenize, sent_tokenize
 from nltk.stem import WordNetLemmatizer
 from nltk import pos_tag
 
+
 def _ensure_nltk_data():
     try:
         nltk.data.find("tokenizers/punkt")
@@ -35,33 +36,42 @@ def _ensure_nltk_data():
             nltk.download("punkt_tab", quiet=True)
         except Exception:
             pass
+
     for corpus in ["stopwords", "wordnet", "omw-1.4"]:
         try:
             nltk.data.find(f"corpora/{corpus}")
         except LookupError:
             nltk.download(corpus, quiet=True)
+
     # POS tagger: new + legacy names
     def _ensure_tagger():
         try:
-            nltk.data.find("taggers/averaged_perceptron_tagger_eng"); return
+            nltk.data.find("taggers/averaged_perceptron_tagger_eng")
+            return
         except LookupError:
             pass
         try:
-            nltk.data.find("taggers/averaged_perceptron_tagger"); return
+            nltk.data.find("taggers/averaged_perceptron_tagger")
+            return
         except LookupError:
             pass
         try:
             nltk.download("averaged_perceptron_tagger_eng", quiet=True)
-            nltk.data.find("taggers/averaged_perceptron_tagger_eng"); return
+            nltk.data.find("taggers/averaged_perceptron_tagger_eng")
+            return
         except LookupError:
             nltk.download("averaged_perceptron_tagger", quiet=True)
             nltk.data.find("taggers/averaged_perceptron_tagger")
+
     try:
         _ensure_tagger()
     except LookupError:
+        # fall back: handled in safe_pos_tag
         pass
 
+
 _ensure_nltk_data()
+
 
 def safe_pos_tag(tokens):
     try:
@@ -78,6 +88,7 @@ def safe_pos_tag(tokens):
         except Exception:
             return [(t, "NN") for t in tokens]
 
+
 print("CUDA available:", torch.cuda.is_available())
 
 # -------------------------------
@@ -89,17 +100,18 @@ HUMAN_CSV = "data/MeDAL/pretrain_subset/human_summaries_for_rouge.csv"
 
 OUT_DIR = "outputs(Qwen3-0.6B)_switchable"
 os.makedirs(OUT_DIR, exist_ok=True)
-OUT_CSV      = os.path.join(OUT_DIR, "results.csv")
-HEATMAP_PNG  = os.path.join(OUT_DIR, "metric_correlation_heatmap.png")
-BAR_PNG      = os.path.join(OUT_DIR, "avg_metrics_bar.png")
+OUT_CSV = os.path.join(OUT_DIR, "results.csv")
+HEATMAP_PNG = os.path.join(OUT_DIR, "metric_correlation_heatmap.png")
+BAR_PNG = os.path.join(OUT_DIR, "avg_metrics_bar.png")
+SCATTER_PNG = os.path.join(OUT_DIR, "nli_vs_hallucination_scatter.png")
 
-N_SAMPLES = 90  # <- run over 90 items
-SEED = 42       # for reproducibility of sampling/generation if desired
+N_SAMPLES = 90  # run over 90 items
+SEED = 42
 torch.manual_seed(SEED)
 np.random.seed(SEED)
 
 # Choose hallucination method: "heuristic" or "nli"
-HALLUCINATION_METHOD = "nli"  # change to "heuristic" to use the lightweight method
+HALLUCINATION_METHOD = "nli"  # change to "heuristic" if you want the lightweight method
 
 # -------------------------------
 # Load data and model
@@ -112,7 +124,7 @@ tokenizer = AutoTokenizer.from_pretrained(model_name)
 model = AutoModelForCausalLM.from_pretrained(
     model_name,
     torch_dtype="auto",
-    device_map="auto"
+    device_map="auto",
 )
 print("Model loaded successfully!")
 
@@ -133,19 +145,44 @@ gen_cfg = GenerationConfig(
 # Heuristic hallucination helpers
 # -------------------------------
 SCIENTIFIC_FILLERS = {
-    "study","studies","analysis","analyses","model","group","groups","control",
-    "function","functions","results","findings","indicating","showed","observed",
-    "parameters","measurements","disease","method","methods","purpose","aim"
+    "study",
+    "studies",
+    "analysis",
+    "analyses",
+    "model",
+    "group",
+    "groups",
+    "control",
+    "function",
+    "functions",
+    "results",
+    "findings",
+    "indicating",
+    "showed",
+    "observed",
+    "parameters",
+    "measurements",
+    "disease",
+    "method",
+    "methods",
+    "purpose",
+    "aim",
 }
 wnl = WordNetLemmatizer()
 STOPWORDS = set(stopwords.words("english"))
 
+
 def _to_wn_pos(tag: str):
-    if tag.startswith("J"): return wordnet.ADJ
-    if tag.startswith("V"): return wordnet.VERB
-    if tag.startswith("N"): return wordnet.NOUN
-    if tag.startswith("R"): return wordnet.ADV
+    if tag.startswith("J"):
+        return wordnet.ADJ
+    if tag.startswith("V"):
+        return wordnet.VERB
+    if tag.startswith("N"):
+        return wordnet.NOUN
+    if tag.startswith("R"):
+        return wordnet.ADV
     return wordnet.NOUN
+
 
 def normalize_and_lemmatize(text: str):
     toks = word_tokenize(text)
@@ -157,12 +194,17 @@ def normalize_and_lemmatize(text: str):
             lemmas.append(wnl.lemmatize(t, pos=_to_wn_pos(tag)))
     return lemmas
 
-def heuristic_hallucination_score(source_text: str, summary_text: str, rouge1_f1: float) -> (float, str, dict):
+
+def heuristic_hallucination_score(
+    source_text: str, summary_text: str, rouge1_f1: float
+) -> (float, str, dict):
     src_tokens = normalize_and_lemmatize(source_text)
     sum_tokens = normalize_and_lemmatize(summary_text)
 
     src_set = set(src_tokens)
-    unsupported_src = [w for w in sum_tokens if w not in src_set and w not in SCIENTIFIC_FILLERS]
+    unsupported_src = [
+        w for w in sum_tokens if w not in src_set and w not in SCIENTIFIC_FILLERS
+    ]
 
     src_numbers = set(re.findall(r"\d+(?:\.\d+)?", source_text.lower()))
     sum_numbers = set(re.findall(r"\d+(?:\.\d+)?", summary_text.lower()))
@@ -178,11 +220,13 @@ def heuristic_hallucination_score(source_text: str, summary_text: str, rouge1_f1
         level = "MEDIUM"
     else:
         level = "HIGH"
+
     dbg = {
         "unsupported_tokens": unsupported_src,
-        "numeric_hallucinated": numeric_hallucinated
+        "numeric_hallucinated": numeric_hallucinated,
     }
     return score, level, dbg
+
 
 # -------------------------------
 # NLI-based factuality helpers
@@ -191,8 +235,11 @@ ENTAILMENT_LABEL = 2  # roberta-large-mnli label order: [contradiction, neutral,
 if HALLUCINATION_METHOD == "nli":
     nli_name = "roberta-large-mnli"
     nli_tok = AutoTokenizer.from_pretrained(nli_name)
-    nli_model = AutoModelForSequenceClassification.from_pretrained(nli_name).to(model.device)
+    nli_model = AutoModelForSequenceClassification.from_pretrained(nli_name).to(
+        model.device
+    )
     nli_model.eval()
+
 
 def _chunk_text_by_tokens(text, max_tokens=420):
     sents = sent_tokenize(text)
@@ -203,10 +250,12 @@ def _chunk_text_by_tokens(text, max_tokens=420):
             chunks.append(" ".join(cur))
             cur, cur_len = [s], l
         else:
-            cur.append(s); cur_len += l
+            cur.append(s)
+            cur_len += l
     if cur:
         chunks.append(" ".join(cur))
     return chunks or [text]
+
 
 @torch.no_grad()
 def nli_entailment_score(source_text: str, summary_text: str) -> float:
@@ -222,10 +271,11 @@ def nli_entailment_score(source_text: str, summary_text: str) -> float:
         probs_for_hypo = []
         for prem in src_chunks:
             enc = nli_tok(
-                prem, hypo,
+                prem,
+                hypo,
                 return_tensors="pt",
                 truncation=True,
-                max_length=512
+                max_length=512,
             ).to(nli_model.device)
             logits = nli_model(**enc).logits
             probs = torch.softmax(logits, dim=-1).detach().cpu().numpy()[0]
@@ -233,12 +283,15 @@ def nli_entailment_score(source_text: str, summary_text: str) -> float:
         entail_scores.append(float(np.max(probs_for_hypo)))
     return float(np.mean(entail_scores)) if entail_scores else 0.0
 
+
 def nli_score_to_level(h: float) -> str:
+    # h here is hallucination_score (= 1 - entailment)
     if h < 0.15:
         return "LOW"
     elif h < 0.35:
         return "MEDIUM"
     return "HIGH"
+
 
 # -------------------------------
 # Summarize + score + log CSV
@@ -272,28 +325,32 @@ for i in range(limit):
         messages,
         tokenize=False,
         add_generation_prompt=True,
-        enable_thinking=False
+        enable_thinking=False,
     )
 
     model_inputs = tokenizer(
         [text],
         return_tensors="pt",
         truncation=True,
-        max_length=tokenizer.model_max_length
+        max_length=tokenizer.model_max_length,
     ).to(model.device)
 
     with torch.no_grad():
         generated_ids = model.generate(
             **model_inputs,
-            generation_config=gen_cfg
+            generation_config=gen_cfg,
         )
 
     # strip prompt
-    output_ids = generated_ids[0][len(model_inputs.input_ids[0]):].tolist()
-    generated_summary = tokenizer.decode(output_ids, skip_special_tokens=True).strip()
+    output_ids = generated_ids[0][len(model_inputs.input_ids[0]) :].tolist()
+    generated_summary = tokenizer.decode(
+        output_ids, skip_special_tokens=True
+    ).strip()
+
     # strip any <think>...</think>
     generated_summary = re.sub(r"(?is)<think>.*?</think>\s*", "", generated_summary)
     generated_summary = re.sub(r"(?is)^.*?</think>\s*", "", generated_summary)
+
     # cap at 3 sentences
     sents = sent_tokenize(generated_summary)
     if len(sents) > 3:
@@ -304,18 +361,25 @@ for i in range(limit):
 
     # TF-IDF (source vs summary)
     corpus = [original_text, generated_summary]
-    vectorizer = TfidfVectorizer(stop_words="english", lowercase=True, ngram_range=(1, 2))
+    vectorizer = TfidfVectorizer(
+        stop_words="english",
+        lowercase=True,
+        ngram_range=(1, 2),
+    )
     tfidf_matrix = vectorizer.fit_transform(corpus)
     similarity = cosine_similarity(tfidf_matrix[0:1], tfidf_matrix[1:2])[0][0]
     print("\n--- TF-IDF SIMILARITY ---")
     print(f"Cosine similarity (original vs summary): {similarity:.4f}")
 
     # ROUGE (human vs model summary)
-    scorer = rouge_scorer.RougeScorer(["rouge1", "rouge2", "rougeL"], use_stemmer=True)
+    scorer = rouge_scorer.RougeScorer(
+        ["rouge1", "rouge2", "rougeL"],
+        use_stemmer=True,
+    )
     scores = scorer.score(human_summary, generated_summary)
-    r1 = scores['rouge1'].fmeasure
-    r2 = scores['rouge2'].fmeasure
-    rL = scores['rougeL'].fmeasure
+    r1 = scores["rouge1"].fmeasure
+    r2 = scores["rouge2"].fmeasure
+    rL = scores["rougeL"].fmeasure
     print("\n--- ROUGE (model vs human) ---")
     print(f"ROUGE-1 F1: {r1:.4f}")
     print(f"ROUGE-2 F1: {r2:.4f}")
@@ -325,7 +389,7 @@ for i in range(limit):
     if HALLUCINATION_METHOD == "nli":
         print("\n--- NLI FACTUALITY (ENTAILMENT) ---")
         entail = nli_entailment_score(original_text, generated_summary)
-        hallucination_score = 1.0 - entail
+        hallucination_score = 1.0 - entail  # <- mirror metric (expected strong -corr)
         level = nli_score_to_level(hallucination_score)
         print(f"Avg entailment: {entail:.3f}")
         print(f"Hallucination score: {hallucination_score:.3f} -> {level}")
@@ -335,7 +399,9 @@ for i in range(limit):
         }
     else:
         print("\n--- HEURISTIC HALLUCINATION ---")
-        score, level, dbg = heuristic_hallucination_score(original_text, generated_summary, r1)
+        score, level, dbg = heuristic_hallucination_score(
+            original_text, generated_summary, r1
+        )
         hallucination_score = score
         print(f"Unsupported tokens: {dbg['unsupported_tokens']}")
         print(f"Numeric hallucinations: {dbg['numeric_hallucinated']}")
@@ -358,7 +424,7 @@ for i in range(limit):
         "rougeL_f1": float(rL),
         "hallucination_score": float(hallucination_score),
         "hallucination_level": level,
-        "generated_summary": generated_summary
+        "generated_summary": generated_summary,
     }
     row_out.update(row_out_extra)
     row_out.update(dbg_fields)
@@ -367,20 +433,67 @@ for i in range(limit):
 # Save CSV (append if exists)
 out_df = pd.DataFrame(rows_out)
 if os.path.exists(OUT_CSV):
-    out_df.to_csv(OUT_CSV, mode="a", header=False, index=False, encoding="utf-8")
+    out_df.to_csv(
+        OUT_CSV,
+        mode="a",
+        header=False,
+        index=False,
+        encoding="utf-8",
+    )
 else:
     out_df.to_csv(OUT_CSV, index=False, encoding="utf-8")
 print(f"\nSaved results to: {OUT_CSV}")
 
 # -------------------------------
-# Visualizations
+# Visualizations + sanity checks
 # -------------------------------
-if HALLUCINATION_METHOD == "nli":
-    metrics_cols = ["tfidf_cosine", "rouge1_f1", "rouge2_f1", "rougeL_f1", "nli_avg_entailment", "hallucination_score"]
-else:
-    metrics_cols = ["tfidf_cosine", "rouge1_f1", "rouge2_f1", "rougeL_f1", "hallucination_score"]
-
 df_all = pd.read_csv(OUT_CSV)
+
+# metrics for heatmap
+if HALLUCINATION_METHOD == "nli":
+    metrics_cols = [
+        "tfidf_cosine",
+        "rouge1_f1",
+        "rouge2_f1",
+        "rougeL_f1",
+        "nli_avg_entailment",
+        "hallucination_score",
+    ]
+else:
+    metrics_cols = [
+        "tfidf_cosine",
+        "rouge1_f1",
+        "rouge2_f1",
+        "rougeL_f1",
+        "hallucination_score",
+    ]
+
+# --- sanity checks if we are using NLI ---
+if HALLUCINATION_METHOD == "nli" and "nli_avg_entailment" in df_all.columns:
+    print("\nNLI & hallucination summary stats:")
+    print(df_all[["nli_avg_entailment", "hallucination_score"]].describe())
+
+    # value range checks (if using prob-like scores)
+    if not df_all["hallucination_score"].between(0, 1).all():
+        print("Warning: some hallucination_score values are outside [0, 1].")
+    if not df_all["nli_avg_entailment"].between(0, 1).all():
+        print("Warning: some nli_avg_entailment values are outside [0, 1].")
+
+    print("\nCorrelation NLI vs hallucination:")
+    print(df_all[["nli_avg_entailment", "hallucination_score"]].corr())
+
+    # scatter: NLI vs hallucination
+    fig_sc, ax_sc = plt.subplots(figsize=(5, 4))
+    ax_sc.scatter(
+        df_all["nli_avg_entailment"], df_all["hallucination_score"], alpha=0.6
+    )
+    ax_sc.set_xlabel("NLI average entailment")
+    ax_sc.set_ylabel("Hallucination score (1 - entailment)")
+    ax_sc.set_title("NLI vs hallucination")
+    fig_sc.tight_layout()
+    fig_sc.savefig(SCATTER_PNG, dpi=200)
+    plt.close(fig_sc)
+    print(f"Saved scatter plot: {SCATTER_PNG}")
 
 # 1) Correlation heatmap
 corr = df_all[metrics_cols].corr()
@@ -394,7 +507,13 @@ ax.set_title("Metric correlation heatmap")
 
 for irow in range(corr.shape[0]):
     for jcol in range(corr.shape[1]):
-        ax.text(jcol, irow, f"{corr.values[irow, jcol]:.2f}", ha="center", va="center")
+        ax.text(
+            jcol,
+            irow,
+            f"{corr.values[irow, jcol]:.2f}",
+            ha="center",
+            va="center",
+        )
 
 fig.colorbar(im, ax=ax)
 fig.tight_layout()
@@ -402,14 +521,15 @@ fig.savefig(HEATMAP_PNG, dpi=200)
 plt.close(fig)
 print(f"Saved heatmap: {HEATMAP_PNG}")
 
-# 2) Average metrics bar chart
+# 2) Average metrics bar chart (using all rows currently in CSV)
 means = df_all[metrics_cols].mean()
 fig2, ax2 = plt.subplots(figsize=(8, 4))
 ax2.bar(means.index, means.values)
-ax2.set_title(f"Average metrics over {N_SAMPLES} items")
+ax2.set_title(f"Average metrics over {len(df_all)} items")
 ax2.set_ylabel("Score")
-ax2.tick_params(axis='x', labelrotation=20)
+ax2.tick_params(axis="x", labelrotation=20)
 fig2.tight_layout()
 fig2.savefig(BAR_PNG, dpi=200)
 plt.close(fig2)
 print(f"Saved bar chart: {BAR_PNG}")
+
