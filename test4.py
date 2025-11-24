@@ -52,15 +52,14 @@ print("CUDA available:", torch.cuda.is_available())
 # -------------------------------
 # Config
 # -------------------------------
-model_name = "Qwen/Qwen3-30B-A3B-Thinking-2507"
-#model_name = "Qwen/Qwen3-Reranker-8B"
+
+model_name = "Qwen/Qwen3-Reranker-8B"
 #model_name = "Qwen/Qwen3-0.6B"
 TEST_CSV = "data/MeDAL/pretrain_subset/test.csv"
 HUMAN_CSV = "data/MeDAL/pretrain_subset/human_summaries_for_rouge.csv"
 
 #OUT_DIR = "outputs(Qwen3-0.6B)_GPT"
-#OUT_DIR = "outputs(Qwen3-Reranker-8B)_GPT"
-OUT_DIR = "outputs(Qwen3-30B-A3B-Thinking-2507)_GPT"
+OUT_DIR = "outputs(Qwen3-Reranker-8B)_GPT"
 os.makedirs(OUT_DIR, exist_ok=True)
 OUT_CSV = os.path.join(OUT_DIR, "results.csv")
 HEATMAP_PNG = os.path.join(OUT_DIR, "metric_correlation_heatmap.png")
