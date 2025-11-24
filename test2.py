@@ -95,11 +95,13 @@ print("CUDA available:", torch.cuda.is_available())
 # -------------------------------
 # Config
 # -------------------------------
-model_name = "Qwen/Qwen3-0.6B"
+model_name = "Qwen/Qwen3-Reranker-8B"
+#model_name = "Qwen/Qwen3-0.6B"
 TEST_CSV = "data/MeDAL/pretrain_subset/test.csv"
 HUMAN_CSV = "data/MeDAL/pretrain_subset/human_summaries_for_rouge.csv"
 
-OUT_DIR = "outputs(Qwen3-0.6B)"
+#OUT_DIR = "outputs(Qwen3-0.6B)"
+OUT_DIR = "outputs(Qwen3-Reranker-8B)"
 os.makedirs(OUT_DIR, exist_ok=True)
 OUT_CSV = os.path.join(OUT_DIR, "results.csv")
 HEATMAP_PNG = os.path.join(OUT_DIR, "metric_correlation_heatmap.png")
@@ -457,7 +459,7 @@ ax.set_xticks(np.arange(len(metrics_cols_heatmap)))
 ax.set_yticks(np.arange(len(metrics_cols_heatmap)))
 ax.set_xticklabels(metrics_cols_heatmap, rotation=45, ha="right")
 ax.set_yticklabels(metrics_cols_heatmap)
-ax.set_title("Correlation heatmap: TF-IDF & ROUGE only")
+ax.set_title("Correlation heatmap: TF-IDF & ROUGE")
 
 for irow in range(corr.shape[0]):
     for jcol in range(corr.shape[1]):
