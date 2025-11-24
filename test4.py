@@ -1,5 +1,6 @@
 import os
 import re
+import json
 from datetime import datetime
 
 import numpy as np
@@ -26,13 +27,10 @@ from openai import OpenAI
 client = OpenAI()
 
 # -------------------------------
-# NLTK: tokenization + lemmatization
+# NLTK: tokenization (for sentence splitting)
 # -------------------------------
 import nltk
-from nltk.corpus import stopwords, wordnet
-from nltk.tokenize import word_tokenize, sent_tokenize
-from nltk.stem import WordNetLemmatizer
-from nltk import pos_tag
+from nltk.tokenize import sent_tokenize
 
 
 def _ensure_nltk_data():
@@ -46,68 +44,23 @@ def _ensure_nltk_data():
         except Exception:
             pass
 
-    # corpora
-    for corpus in ["stopwords", "wordnet", "omw-1.4"]:
-        try:
-            nltk.data.find(f"corpora/{corpus}")
-        except LookupError:
-            nltk.download(corpus, quiet=True)
-
-    # POS tagger
-    def _ensure_tagger():
-        try:
-            nltk.data.find("taggers/averaged_perceptron_tagger_eng")
-            return
-        except LookupError:
-            pass
-        try:
-            nltk.data.find("taggers/averaged_perceptron_tagger")
-            return
-        except LookupError:
-            pass
-        try:
-            nltk.download("averaged_perceptron_tagger_eng", quiet=True)
-            nltk.data.find("taggers/averaged_perceptron_tagger_eng")
-            return
-        except LookupError:
-            nltk.download("averaged_perceptron_tagger", quiet=True)
-            nltk.data.find("taggers/averaged_perceptron_tagger")
-
-    try:
-        _ensure_tagger()
-    except LookupError:
-        pass
-
 
 _ensure_nltk_data()
-
-
-def safe_pos_tag(tokens):
-    try:
-        return pos_tag(tokens, lang="eng")
-    except LookupError:
-        try:
-            nltk.download("averaged_perceptron_tagger_eng", quiet=True)
-            return pos_tag(tokens, lang="eng")
-        except Exception:
-            pass
-        try:
-            nltk.download("averaged_perceptron_tagger", quiet=True)
-            return pos_tag(tokens, lang="eng")
-        except Exception:
-            return [(t, "NN") for t in tokens]
-
 
 print("CUDA available:", torch.cuda.is_available())
 
 # -------------------------------
 # Config
 # -------------------------------
-model_name = "Qwen/Qwen3-0.6B"
+model_name = "Qwen/Qwen3-30B-A3B-Thinking-2507"
+#model_name = "Qwen/Qwen3-Reranker-8B"
+#model_name = "Qwen/Qwen3-0.6B"
 TEST_CSV = "data/MeDAL/pretrain_subset/test.csv"
 HUMAN_CSV = "data/MeDAL/pretrain_subset/human_summaries_for_rouge.csv"
 
-OUT_DIR = "outputs(Qwen3-0.6B)"
+#OUT_DIR = "outputs(Qwen3-0.6B)_GPT"
+#OUT_DIR = "outputs(Qwen3-Reranker-8B)_GPT"
+OUT_DIR = "outputs(Qwen3-30B-A3B-Thinking-2507)_GPT"
 os.makedirs(OUT_DIR, exist_ok=True)
 OUT_CSV = os.path.join(OUT_DIR, "results.csv")
 HEATMAP_PNG = os.path.join(OUT_DIR, "metric_correlation_heatmap.png")
@@ -138,7 +91,6 @@ print("Model loaded successfully!")
 
 base = model.generation_config
 gen_cfg = GenerationConfig(
-    # you can keep sampling, or switch to greedy by do_sample=False
     do_sample=True,
     temperature=0.7,
     top_p=0.9,
@@ -160,25 +112,41 @@ def gpt4_hallucination_judge(
 ):
     """
     Uses GPT-4o-mini as hallucination detector.
+
     Returns:
-        hallucinated: True / False / None
-        explanation: str
+        score: float in [0, 1] (proportion of hallucinated statements)
+        raw_text: raw model output (for debugging only)
     """
     judge_prompt = (
-        "You are an expert evaluator of scientific summaries.\n\n"
-        "You will be given:\n"
-        "1) SOURCE: the original scientific text.\n"
-        "2) SUMMARY: a model-generated summary.\n"
-        "3) Optionally a HUMAN reference summary.\n\n"
+        "You will evaluate how hallucinated the SUMMARY is compared to the SOURCE.\n"
+        "Definition: A hallucination is any factual claim in the SUMMARY that is not supported by the SOURCE.\n\n"
         "Task:\n"
-        "- Decide if the SUMMARY contains any hallucinations: facts, numbers, "
-        "or claims that are NOT supported by the SOURCE text.\n"
-        "- Ignore style and grammar. Focus only on factual faithfulness.\n\n"
-        "Output format (IMPORTANT):\n"
-        "First line MUST be exactly one of:\n"
-        "  hallucinated: YES\n"
-        "  hallucinated: NO\n"
-        "Then, on the following lines, briefly explain your reasoning.\n\n"
+        "- Read the SOURCE carefully.\n"
+        "- Read the SUMMARY carefully.\n"
+        "- Decide how hallucinated the SUMMARY is.\n\n"
+        "Give ONE number between 0 and 1 ONLY, where:\n"
+        "0.0 = No hallucination at all (perfectly faithful)\n"
+        "0.1 = Very tiny hallucination\n"
+        "0.15 = Slight hallucination\n"
+        "0.2 = Small hallucination\n"
+        "0.25 = Small–moderate hallucination\n"
+        "0.3 = Noticeable hallucination\n"
+        "0.35 = Noticeable–moderate hallucination\n"
+        "0.4 = Moderate hallucination\n"
+        "0.45 = Moderate–strong hallucination\n"
+        "0.5 = Half correct / half hallucinated\n"
+        "0.55 = Strong-ish hallucination\n"
+        "0.6 = Strong hallucination\n"
+        "0.65 = Strong–very strong hallucination\n"
+        "0.7 = Very strong hallucination\n"
+        "0.8 = Severe hallucination\n"
+        "0.9 = Extremely strong hallucination\n"
+        "1.0 = Completely hallucinated\n\n"
+        "IMPORTANT RULES:\n"
+        "- Output ONLY the number.\n"
+        "- No explanation.\n"
+        "- No JSON.\n"
+        "- Do NOT include any explanation, comments, or extra text.\n\n"
         f"SOURCE:\n{source_text}\n\n"
         f"SUMMARY (model):\n{model_summary}\n\n"
     )
@@ -186,11 +154,11 @@ def gpt4_hallucination_judge(
     if human_summary is not None:
         judge_prompt += f"HUMAN reference summary (for context):\n{human_summary}\n\n"
 
-    judge_prompt += "Now give your decision following the required format."
+    judge_prompt += "Now output only the JSON object with the hallucination_score."
 
     try:
         response = client.chat.completions.create(
-            model="gpt-4o-mini",  # or "gpt-4o" if you prefer
+            model="gpt-4o-mini",
             messages=[
                 {
                     "role": "system",
@@ -204,78 +172,26 @@ def gpt4_hallucination_judge(
             temperature=0,
         )
     except openai_module.OpenAIError as e:
-        # If quota error / invalid key etc., return None so script continues
-        return None, f"OpenAI error: {e}"
+        # If quota error / invalid key etc., return NaN so script continues
+        return np.nan, f"OpenAI error: {e}"
 
     text_out = response.choices[0].message.content.strip()
-    lines = [l for l in text_out.splitlines() if l.strip()]
-    if not lines:
-        return None, text_out
 
-    first_line = lines[0].lower()
-    explanation = "\n".join(lines[1:]).strip()
-
-    if "hallucinated: yes" in first_line:
-        return True, explanation or text_out
-    if "hallucinated: no" in first_line:
-        return False, explanation or text_out
-
-    # fallback if format not followed
-    return None, text_out
-
-
-# -------------------------------
-# Heuristic hallucination helpers
-# -------------------------------
-SCIENTIFIC_FILLERS = {
-    "study",
-    "studies",
-    "analysis",
-    "analyses",
-    "model",
-    "group",
-    "groups",
-    "control",
-    "function",
-    "functions",
-    "results",
-    "findings",
-    "indicating",
-    "showed",
-    "observed",
-    "parameters",
-    "measurements",
-    "disease",
-    "method",
-    "methods",
-    "purpose",
-    "aim",
-}
-wnl = WordNetLemmatizer()
-STOPWORDS = set(stopwords.words("english"))
-
-
-def _to_wn_pos(tag: str):
-    if tag.startswith("J"):
-        return wordnet.ADJ
-    if tag.startswith("V"):
-        return wordnet.VERB
-    if tag.startswith("N"):
-        return wordnet.NOUN
-    if tag.startswith("R"):
-        return wordnet.ADV
-    return wordnet.NOUN
-
-
-def normalize_and_lemmatize(text: str):
-    toks = word_tokenize(text)
-    tagged = safe_pos_tag(toks)
-    lemmas = []
-    for tok, tag in tagged:
-        t = tok.lower()
-        if t.isalpha() and t not in STOPWORDS:
-            lemmas.append(wnl.lemmatize(t, pos=_to_wn_pos(tag)))
-    return lemmas
+    # Try to parse JSON
+    try:
+        obj = json.loads(text_out)
+        score = float(obj.get("hallucination_score", 0.0))
+        # Clip to [0, 1] just in case
+        score = max(0.0, min(1.0, score))
+        return score, text_out
+    except Exception:
+        # Fallback: try to extract a float if JSON is slightly malformed
+        m = re.search(r"(\d*\.?\d+)", text_out)
+        if not m:
+            return np.nan, text_out
+        score = float(m.group(1))
+        score = max(0.0, min(1.0, score))
+        return score, text_out
 
 
 # -------------------------------
@@ -336,9 +252,11 @@ for i in range(limit):
         output_ids, skip_special_tokens=True
     ).strip()
 
+    # strip any <think>...</think> blocks if present
     generated_summary = re.sub(r"(?is)<think>.*?</think>\s*", "", generated_summary)
     generated_summary = re.sub(r"(?is)^.*?</think>\s*", "", generated_summary)
 
+    # keep max 3 sentences
     sents = sent_tokenize(generated_summary)
     if len(sents) > 3:
         generated_summary = " ".join(sents[:3])
@@ -346,7 +264,7 @@ for i in range(limit):
     print("\n--- SUMMARY (MODEL) ---\n")
     print(generated_summary)
 
-    # TF-IDF
+    # TF-IDF similarity
     corpus = [original_text, generated_summary]
     vectorizer = TfidfVectorizer(
         stop_words="english",
@@ -358,7 +276,7 @@ for i in range(limit):
     print("\n--- TF-IDF SIMILARITY ---")
     print(f"Cosine similarity (original vs summary): {similarity:.4f}")
 
-    # ROUGE
+    # ROUGE (model vs human)
     scores = scorer.score(human_summary, generated_summary)
     r1 = scores["rouge1"].fmeasure
     r2 = scores["rouge2"].fmeasure
@@ -369,64 +287,16 @@ for i in range(limit):
     print(f"ROUGE-L F1: {rL:.4f}")
 
     # ---------------------------
-    # Hallucination way 1: GPT-4o-mini (LLM-as-Judge)
+    # Hallucination: GPT-4o-mini (LLM-as-Judge)
     # ---------------------------
     print("\n--- GPT-4o-mini HALLUCINATION (LLM-as-Judge) ---")
-    hallucinated_gpt4, expl_gpt4 = gpt4_hallucination_judge(
+    hallucination_gpt4, raw_gpt4 = gpt4_hallucination_judge(
         original_text,
         generated_summary,
         human_summary,
     )
-    if hallucinated_gpt4 is True:
-        hallucination_gpt4 = 1.0
-        level_gpt4 = "HIGH"
-    elif hallucinated_gpt4 is False:
-        hallucination_gpt4 = 0.0
-        level_gpt4 = "LOW"
-    else:
-        hallucination_gpt4 = np.nan
-        level_gpt4 = "UNKNOWN"
 
-    print(f"Hallucinated (GPT-4o-mini): {hallucinated_gpt4}")
-    print("Explanation:")
-    print(expl_gpt4)
-
-    # ---------------------------
-    # Hallucination way 2: heuristic
-    # ---------------------------
-    print("\n--- HEURISTIC HALLUCINATION (TRULY UNSUPPORTED) ---")
-    src_tokens = normalize_and_lemmatize(original_text)
-    sum_tokens = normalize_and_lemmatize(generated_summary)
-    ref_tokens = normalize_and_lemmatize(human_summary)
-
-    src_set, ref_set = set(src_tokens), set(ref_tokens)
-    unsupported_src = [
-        w for w in sum_tokens
-        if w not in src_set and w not in SCIENTIFIC_FILLERS
-    ]
-    truly_unsupported = [w for w in unsupported_src if w not in ref_set]
-
-    src_numbers = set(re.findall(r"\d+(?:\.\d+)?", original_text.lower()))
-    sum_numbers = set(re.findall(r"\d+(?:\.\d+)?", generated_summary.lower()))
-    numeric_hallucinated = [n for n in sum_numbers if n not in src_numbers]
-
-    unsupported_ratio = (len(truly_unsupported) / len(sum_tokens)) if sum_tokens else 0.0
-    soften = 1.0 - min(r1, 0.6) * 0.3
-    hallucination_heur = min(
-        1.0,
-        unsupported_ratio * soften + 0.05 * len(numeric_hallucinated),
-    )
-
-    if hallucination_heur < 0.15:
-        level_heur = "LOW"
-    elif hallucination_heur < 0.35:
-        level_heur = "MEDIUM"
-    else:
-        level_heur = "HIGH"
-
-    print(f"Unsupported tokens (truly unsupported): {truly_unsupported}")
-    print(f"Numeric hallucinations: {numeric_hallucinated}")
-    print(f"Heuristic hallucination score: {hallucination_heur:.3f} -> {level_heur}")
+    print(f"Hallucination score (GPT-4o-mini): {hallucination_gpt4:.4f}")
 
     rows_out.append({
         "run_timestamp": run_stamp,
@@ -439,18 +309,9 @@ for i in range(limit):
         "rouge2_f1": float(r2),
         "rougeL_f1": float(rL),
 
-        # GPT-4o-mini metric
+        # GPT-4o-mini numeric hallucination metric in [0, 1]
         "hallucination_gpt4": float(hallucination_gpt4) if not np.isnan(hallucination_gpt4) else np.nan,
-        "hallucination_level_gpt4": level_gpt4,
-        "gpt4_explanation": expl_gpt4,
 
-        # heuristic metric
-        "hallucination_heuristic": float(hallucination_heur),
-        "hallucination_level_heuristic": level_heur,
-        "unsupported_count": len(truly_unsupported),
-        "numeric_hallucinated_count": len(numeric_hallucinated),
-        "unsupported_tokens": " ".join(truly_unsupported),
-        "numeric_hallucinated": " ".join(numeric_hallucinated),
         "generated_summary": generated_summary,
     })
 
@@ -488,7 +349,7 @@ ax.set_xticks(np.arange(len(metrics_cols_heatmap)))
 ax.set_yticks(np.arange(len(metrics_cols_heatmap)))
 ax.set_xticklabels(metrics_cols_heatmap, rotation=45, ha="right")
 ax.set_yticklabels(metrics_cols_heatmap)
-ax.set_title("Correlation heatmap: TF-IDF & ROUGE only")
+ax.set_title("Correlation heatmap: TF-IDF & ROUGE")
 
 for irow in range(corr.shape[0]):
     for jcol in range(corr.shape[1]):
@@ -506,29 +367,18 @@ fig.savefig(HEATMAP_PNG, dpi=200)
 plt.close(fig)
 print(f"Saved heatmap: {HEATMAP_PNG}")
 
-# 2) Line plot: GPT-4o-mini vs heuristic hallucination
+# 2) Line plot: GPT-4o-mini hallucination (simple line only)
 fig2, ax2 = plt.subplots(figsize=(6, 4))
 x = df_all["sample_idx"].values
 
-ax2.plot(
-    x,
-    df_all["hallucination_gpt4"].values,
-    marker="o",
-    label="GPT-4o-mini hallucination",
-)
-ax2.plot(
-    x,
-    df_all["hallucination_heuristic"].values,
-    marker="s",
-    label="Heuristic hallucination",
-)
+# Simple line: no markers, no legend, no grid
+ax2.plot(x, df_all["hallucination_gpt4"].values)
 
 ax2.set_xlabel("Sample index")
-ax2.set_ylabel("Hallucination score (0/1 or 0–1)")
-ax2.set_title("GPT-4o-mini vs heuristic hallucination across samples")
+ax2.set_ylabel("Hallucination score")
+ax2.set_title("GPT-4o-mini hallucination across samples")
 ax2.set_ylim(0.0, 1.0)
-ax2.grid(True)
-ax2.legend()
+
 fig2.tight_layout()
 fig2.savefig(HALL_LINE_PNG, dpi=200)
 plt.close(fig2)
